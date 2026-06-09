@@ -1,0 +1,27 @@
+# Build outputs
+target/
+build/
+out/
+.gradle/
+*.class
+
+# Gradle wrapper distribution archives
+gradle/wrapper/*.zip
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Logs / tmp
+*.log
+*.tmp
+
+# Local Claude review outputs (kept off GitHub)
+review-output/

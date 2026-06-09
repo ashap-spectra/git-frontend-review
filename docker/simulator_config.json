@@ -1,0 +1,18 @@
+{
+  "driveType": "LTO9",
+  "drivesPerPartition": 5,
+  "loadDelay": 0,
+  "locateDelay": 0,
+  "maxBytesPerSecond": null,
+  "moveDelay": 0,
+  "numPartitions": 5,
+  "tapeType": "LTO9",
+  "tapesPerPartition": 5,
+  "unloadDelay": 4,
+  "virtualLibraryPath": "/etc/spectra/simulator_data",
+  "inspectDelay": 0,
+  "formatDelay": 0,
+  "getTapeGenerationNumberDelay": 0,
+  "getTapeEnvironmentDelay": 0,
+  "deleteTapesOnStartup": false
+}
