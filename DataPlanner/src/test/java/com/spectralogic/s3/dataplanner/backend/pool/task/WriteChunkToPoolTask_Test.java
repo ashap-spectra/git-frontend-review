@@ -33,6 +33,7 @@ import com.spectralogic.s3.common.platform.cache.DiskManager;
 import com.spectralogic.s3.common.rpc.dataplanner.domain.BlobStoreTaskState;
 import com.spectralogic.s3.common.testfrmwrk.MockCacheFilesystemDriver;
 import com.spectralogic.s3.common.testfrmwrk.MockDaoDriver;
+import com.spectralogic.s3.dataplanner.backend.frmwrk.WorkAggregationUtils;
 import com.spectralogic.s3.dataplanner.backend.pool.PoolLockSupportImpl;
 import com.spectralogic.s3.dataplanner.backend.pool.frmwrk.PoolUtils;
 import com.spectralogic.s3.dataplanner.cache.CacheManagerImpl;
@@ -49,8 +50,13 @@ import com.spectralogic.util.testfrmwrk.DatabaseSupportFactory;
 import com.spectralogic.util.testfrmwrk.TestUtil;
 import com.spectralogic.util.testfrmwrk.TestUtil.BlastContainer;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 public final class WriteChunkToPoolTask_Test
 {
@@ -212,7 +218,83 @@ public final class WriteChunkToPoolTask_Test
                 task.getState(),
                 "Shoulda reported completed to not retry.");
     }
-    
+
+    /**
+     * If selectPool throws a non-PoolLockingException (e.g. internal lock-support state is
+     * unexpected — a real condition under which PoolLockSupportImpl can throw IllegalStateException),
+     * BasePoolTask.prepareForExecutionIfPossible invalidates the task. The task transitions to
+     * COMPLETED without runInternal having run; PoolBlobStoreImpl's next pass will deleteTask
+     * it. The LocalBlobDestinations PoolBlobStoreImpl.discoverWork marked IN_PROGRESS must be
+     * reset to PENDING in that path, otherwise they're orphaned until dataplanner restart.
+     */
+    @Test
+    public void testInvalidateWriteTaskResetsDestinationsToPending()
+    {
+        dbSupport.getServiceManager().getService( BucketService.class ).initializeLogicalSizeCache();
+
+        final MockDaoDriver mockDaoDriver = new MockDaoDriver( dbSupport );
+        final Bucket bucket = mockDaoDriver.createBucket( null, "bucket1" );
+        final S3Object object = mockDaoDriver.createObject( bucket.getId(), "o1" );
+        final Blob blob = mockDaoDriver.getBlobFor( object.getId() );
+
+        final Set<JobEntry> chunks =
+                mockDaoDriver.createJobWithEntries( JobRequestType.PUT, CollectionFactory.toSet( blob ) );
+
+        final DataPolicy dataPolicy = mockDaoDriver.getDataPolicyFor( bucket.getId() );
+        final PoolPartition partition = mockDaoDriver.createPoolPartition( null, "dp1" );
+        final StorageDomain storageDomain = mockDaoDriver.createStorageDomain( "sd1" );
+        mockDaoDriver.addPoolPartitionToStorageDomain( storageDomain.getId(), partition.getId() );
+        mockDaoDriver.createDataPersistenceRule(
+                dataPolicy.getId(), DataPersistenceRuleType.PERMANENT, storageDomain.getId() );
+        mockDaoDriver.createPool( partition.getId(), null );
+
+        final Set<LocalBlobDestination> pts = mockDaoDriver.createPersistenceTargetsForChunks(chunks);
+
+        // Reproduce the state PoolBlobStoreImpl.discoverWork() would have committed before
+        // enqueueing the task — destinations IN_PROGRESS.
+        WorkAggregationUtils.markLocalDestinationsInProgress(pts, dbSupport.getServiceManager());
+
+        // Mock PoolLockSupport: getPoolsUnavailableForWriteLock returns empty so selectPool's
+        // strategy picks our pool, then acquireWriteLock throws IllegalStateException (faithful
+        // to real PoolLockSupportImpl behavior when internal state is unexpected — a
+        // non-PoolLockingException that triggers invalidateTaskAndThrow rather than the benign
+        // "try-again-later" path).
+        @SuppressWarnings("unchecked")
+        final PoolLockSupport<PoolTask> mockLockSupport = mock(PoolLockSupport.class);
+        when(mockLockSupport.getPoolsUnavailableForWriteLock(anyLong()))
+                .thenReturn(Collections.emptySet());
+        Mockito.doThrow(new IllegalStateException("simulated lock-support failure"))
+                .when(mockLockSupport).acquireWriteLock(any(), any(), anyLong(), anyLong());
+
+        final WriteChunkToPoolTask task = new PoolTaskBuilder(dbSupport.getServiceManager())
+                .withLockSupport(mockLockSupport)
+                .buildWriteTask(
+                        new LocalWriteDirective(
+                                pts,
+                                storageDomain,
+                                BlobStoreTaskPriority.values()[ 0 ],
+                                chunks,
+                                blob.getLength(),
+                                bucket));
+
+        assertTrue(mockDaoDriver.retrieveAll(LocalBlobDestination.class).stream()
+                        .allMatch(d -> d.getBlobStoreState() == JobChunkBlobStoreState.IN_PROGRESS),
+                "Destinations should start IN_PROGRESS");
+
+        // BasePoolTask.prepareForExecutionIfPossible catches the BlobStoreTaskNoLongerValidException
+        // internally — no exception escapes — but task state ends up COMPLETED.
+        task.prepareForExecutionIfPossible();
+
+        assertEquals(BlobStoreTaskState.COMPLETED, task.getState(),
+                "invalidateTaskAndThrow must leave the task in COMPLETED state");
+
+        assertTrue(mockDaoDriver.retrieveAll(LocalBlobDestination.class).stream()
+                        .allMatch(d -> d.getBlobStoreState() == JobChunkBlobStoreState.PENDING),
+                "Destinations must be reset to PENDING when the task is invalidated before "
+                        + "runInternal runs; otherwise PoolBlobStoreImpl's next pass deleteTasks "
+                        + "the task and leaves destinations orphaned IN_PROGRESS.");
+    }
+
     @Test
     public void testPrepareForExecutionSelectsAndLocksPoolIfSelectionPossible()
     {

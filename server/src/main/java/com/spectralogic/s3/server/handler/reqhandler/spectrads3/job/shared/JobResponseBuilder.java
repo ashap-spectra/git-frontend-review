@@ -101,8 +101,9 @@ public final class JobResponseBuilder
         }
         else
         {
-            boolean entirelyInCache = true;
-            for ( final JobEntry chunk : m_emulatedChunks.values().stream().flatMap(List::stream).toList() )
+            final List<? extends JobEntry> allEntries = m_emulatedChunks.values().stream().flatMap(List::stream).toList();
+            boolean entirelyInCache = !allEntries.isEmpty();
+            for ( final JobEntry chunk : allEntries )
             {
                 entirelyInCache = checkIfEntryInCache(chunk) && entirelyInCache;
             }
@@ -149,7 +150,7 @@ public final class JobResponseBuilder
         }
         else
         {
-            boolean entirelyInCache = true;
+            boolean entirelyInCache = !daoChunks.isEmpty();
             for ( final JobEntry chunk : daoChunks )
             {
                 entirelyInCache = checkIfEntryInCache(chunk) && entirelyInCache;

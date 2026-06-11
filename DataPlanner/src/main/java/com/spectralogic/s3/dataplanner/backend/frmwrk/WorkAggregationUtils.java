@@ -16,6 +16,7 @@ import com.spectralogic.s3.common.platform.notification.domain.event.JobNotifica
 import com.spectralogic.s3.common.platform.notification.generator.S3ObjectsCachedNotificationPayloadGenerator;
 import com.spectralogic.util.bean.BeanUtils;
 import com.spectralogic.util.bean.lang.Identifiable;
+import com.spectralogic.util.db.lang.DatabasePersistable;
 import com.spectralogic.util.db.query.Require;
 import com.spectralogic.util.db.query.WhereClause;
 import com.spectralogic.util.db.service.api.BeansServiceManager;
@@ -102,6 +103,39 @@ public class WorkAggregationUtils {
                 d -> d.setBlobStoreState( JobChunkBlobStoreState.IN_PROGRESS ),
                 Ds3BlobDestination.BLOB_STORE_STATE );
         return destinations.size();
+    }
+
+
+    // Inverse of the mark*InProgress methods above: when a write task is invalidated or deleted
+    // before runInternal completes, its destinations must be reset to PENDING so the next
+    // discovery pass re-aggregates them (the write aggregation filters key off destination state).
+    // Both always filter on IN_PROGRESS so that any destination already advanced to COMPLETED
+    // (e.g. DS3 pre-marks blobs already present on the remote target) is left untouched.
+
+    public static int resetLocalDestinationsToPending(final Collection<? extends LocalBlobDestination> destinations, final BeansServiceManager serviceManager ) {
+        serviceManager.getService( LocalBlobDestinationService.class ).update(
+                inProgressDestinations(destinations),
+                d -> d.setBlobStoreState( JobChunkBlobStoreState.PENDING ),
+                LocalBlobDestination.BLOB_STORE_STATE );
+        return destinations.size();
+    }
+
+    public static <D extends DatabasePersistable & RemoteBlobDestination<D>> int resetRemoteDestinationsToPending(
+            final Class<D> chunkTargetType,
+            final Collection<D> destinations,
+            final BeansServiceManager serviceManager ) {
+        serviceManager.getUpdater( chunkTargetType ).update(
+                inProgressDestinations(destinations),
+                d -> d.setBlobStoreState( JobChunkBlobStoreState.PENDING ),
+                RemoteBlobDestination.BLOB_STORE_STATE );
+        return destinations.size();
+    }
+
+    private static WhereClause inProgressDestinations(final Collection<? extends DatabasePersistable> destinations) {
+        // BLOB_STORE_STATE is the same bean-property name on every destination type.
+        return Require.all(
+                Require.beanPropertyEqualsOneOf(Identifiable.ID, BeanUtils.toMap(destinations).keySet()),
+                Require.beanPropertyEquals(LocalBlobDestination.BLOB_STORE_STATE, JobChunkBlobStoreState.IN_PROGRESS));
     }
 
 

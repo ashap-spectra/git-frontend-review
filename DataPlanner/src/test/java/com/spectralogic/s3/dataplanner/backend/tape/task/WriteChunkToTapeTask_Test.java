@@ -2823,7 +2823,7 @@ public final class WriteChunkToTapeTask_Test
         return new WriteChunkToTapeTask(
                 BlobStoreTaskPriority.values()[ 0 ],
                 pts,
-                tapeEjector,
+                tapeEjector == null ? mock(TapeEjector.class) : tapeEjector,
                 cacheManager,
                 new JobProgressManagerImpl( mockDaoDriver.getServiceManager(), BufferProgressUpdates.NO ),
                 new TapeFailureManagement(mockDaoDriver.getServiceManager()),

@@ -10,12 +10,17 @@ import com.spectralogic.s3.common.dao.service.DaoServicesSeed;
 import com.spectralogic.s3.common.dao.service.ds3.JobProgressManager;
 import com.spectralogic.s3.common.dao.service.ds3.JobProgressManagerImpl;
 import com.spectralogic.s3.common.dao.service.tape.TapeService;
+import com.spectralogic.s3.common.platform.api.TapeEjector;
 import com.spectralogic.s3.common.platform.cache.DiskManager;
 import com.spectralogic.s3.common.platform.cache.MockDiskManager;
 import com.spectralogic.s3.common.rpc.dataplanner.domain.BlobStoreTaskState;
 import com.spectralogic.s3.common.testfrmwrk.MockDaoDriver;
+import com.spectralogic.s3.common.rpc.tape.TapeDriveResource;
+import com.spectralogic.s3.dataplanner.backend.api.BlobStoreTaskNoLongerValidException;
+import com.spectralogic.s3.dataplanner.backend.frmwrk.WorkAggregationUtils;
 import com.spectralogic.s3.dataplanner.backend.tape.TapeLockSupportImpl;
 import com.spectralogic.s3.dataplanner.backend.tape.api.StaticTapeTask;
+import com.spectralogic.s3.dataplanner.backend.tape.api.TapeAvailability;
 import com.spectralogic.s3.dataplanner.backend.tape.api.TapeLockSupport;
 import com.spectralogic.s3.dataplanner.backend.tape.api.TapeTask;
 import com.spectralogic.s3.dataplanner.backend.tape.processor.main.api.internal.Refresh;
@@ -431,6 +436,194 @@ public class TapeBlobStoreProcessorImpl_Test {
         assertEquals(1, tapeBlobStoreProcessor.getTapeTasks().getAllTapeTasks().size());
         verify(mockTapeLockSupport, times(1)).unlock(eq(mockTask));
     }
+
+    /**
+     * If a WriteChunkToTapeTask gets removed from the queue via the processor's deleteTask path
+     * (here triggered naturally by TapeLockSupport.addTapeLock throwing inside startTask's
+     * post-prepare block — see TapeBlobStoreProcessorImpl.java:1208/1244, faithful to a real
+     * IllegalStateException from TapeLockSupportImpl.addTapeLock line 410 when the tape was
+     * concurrently locked by another holder), the LocalBlobDestinations it was driving must be
+     * transitioned back to PENDING. Otherwise they're orphaned IN_PROGRESS with no live task and
+     * stay that way until the dataplanner restarts and BlobStoreDriverImpl.resetEntriesThatWereBeingWorkedOn
+     * sweeps them.
+     *
+     * In 5.x deleteTask had an `else if (t instanceof WriteChunkToTapeTask)` branch that called
+     * m_aggregator.returnTasksForReaggregation; that branch was not ported to 6.0.
+     */
+    @Test
+    public void testDeleteTaskResetsWriteDestinationsToPending() throws Exception {
+        final MockDaoDriver mockDaoDriver = new MockDaoDriver(dbSupport);
+        final DataPolicy dp = mockDaoDriver.createABMConfigSingleCopyOnTape();
+        final Tape tape = mockDaoDriver.createTape(TapeState.NORMAL);
+        final TapePartition partition = mockDaoDriver.attainOneAndOnly(TapePartition.class);
+        final TapeDrive drive = mockDaoDriver.createTapeDrive(partition.getId(), "drv", tape.getId());
+        final Bucket bucket = mockDaoDriver.createBucket(null, dp.getId(), "bucket1");
+        final S3Object o = mockDaoDriver.createObject(bucket.getId(), "o");
+        final Blob blob = mockDaoDriver.getBlobFor(o.getId());
+        final Job job = mockDaoDriver.createJob(bucket.getId(), null, JobRequestType.PUT);
+        mockDaoDriver.updateBean(job.setPriority(BlobStoreTaskPriority.URGENT), Job.PRIORITY);
+        final JobEntry entry = mockDaoDriver.createJobEntry(job.getId(), blob);
+        final Set<LocalBlobDestination> destinations =
+                mockDaoDriver.createPersistenceTargetsForChunks(CollectionFactory.toSet(entry));
+        mockDaoDriver.markBlobInCache(blob.getId());
+
+        // Reproduce the state TapeBlobStoreProcessorImpl.write() would have committed before
+        // enqueueing the task — destinations and entries IN_PROGRESS.
+        WorkAggregationUtils.markWriteChunksInProgress(
+                CollectionFactory.toSet(entry), dbSupport.getServiceManager());
+        WorkAggregationUtils.markLocalDestinationsInProgress(
+                destinations, dbSupport.getServiceManager());
+
+        // Spy a real TapeLockSupport so it answers honestly to the dozens of queries
+        // TapeAvailabilityImpl and the scheduler will make, but make addTapeLock throw the same
+        // IllegalStateException the real implementation throws when the target tape is already
+        // locked by another holder (TapeLockSupportImpl.java:410).
+        mockTapeLockSupport = Mockito.spy(new TapeLockSupportImpl<>(
+                InterfaceProxyFactory.getProxy(RpcClient.class, getRpcClientIh()),
+                dbSupport.getServiceManager()));
+        Mockito.doThrow(new IllegalStateException(
+                        "Tape " + tape.getId() + " is already locked by another holder"))
+                .when(mockTapeLockSupport).addTapeLock(any(), eq(tape.getId()));
+
+        when(mockTapeEnvironment.ensurePhysicalTapeEnvironmentUpToDate(any())).thenReturn(true);
+        when(mockTapeEnvironment.getTapesInPartition(partition.getId()))
+                .thenReturn(Collections.singleton(tape.getId()));
+        when(mockTapeEnvironment.tryPartitionLock(any())).thenReturn(true);
+
+        tapeBlobStoreProcessor = new TapeBlobStoreProcessorImpl(
+                mockTapeLockSupport, dbSupport.getServiceManager(), mockTapeEnvironment,
+                tapeFailureManagement, getDiskManager(), getJobProgressManager());
+
+        final WriteChunkToTapeTask task = new WriteChunkToTapeTask(
+                BlobStoreTaskPriority.URGENT,
+                destinations,
+                mock(TapeEjector.class),
+                new MockDiskManager(dbSupport.getServiceManager()),
+                new JobProgressManagerImpl(dbSupport.getServiceManager()),
+                new TapeFailureManagement(dbSupport.getServiceManager()),
+                dbSupport.getServiceManager());
+        tapeBlobStoreProcessor.getTapeTasks().addDynamicTask(task);
+
+        assertTrue(mockDaoDriver.retrieveAll(LocalBlobDestination.class).stream()
+                        .allMatch(d -> d.getBlobStoreState() == JobChunkBlobStoreState.IN_PROGRESS),
+                "Destinations should start IN_PROGRESS");
+
+        tapeBlobStoreProcessor.start();
+        tapeBlobStoreProcessor.taskSchedulingRequired();
+
+        // The fix recovers the failed task by transitioning it out of PENDING_EXECUTION and
+        // resetting its destinations to PENDING for re-aggregation. Once destinations are PENDING,
+        // discoverTapeWorkAggregated immediately re-aggregates them into a new write task, which
+        // also fails at addTapeLock (the mock throws unconditionally), starting the cycle again.
+        // In production the lock-already-held condition would eventually clear; in this test we
+        // just need to observe that destinations reach PENDING at least once — that's the moment
+        // the orphan invariant is restored.
+        long elapsed = 0;
+        boolean observedPending = false;
+        while (elapsed < 10000) {
+            if (mockDaoDriver.retrieveAll(LocalBlobDestination.class).stream()
+                    .allMatch(d -> d.getBlobStoreState() == JobChunkBlobStoreState.PENDING)) {
+                observedPending = true;
+                break;
+            }
+            Thread.sleep(5);
+            elapsed += 5;
+        }
+        Mockito.verify(mockTapeLockSupport, atLeastOnce()).addTapeLock(any(), eq(tape.getId()));
+
+        // Without the fix the test would fail to observe PENDING because:
+        //   1. deleteTask's call to TapeTaskQueueImpl.remove hits validateDequeue
+        //      (TapeTaskQueueImpl.java:135), which forbids dequeueing a task in PENDING_EXECUTION,
+        //      so the task is stuck in the queue dead (READY-filtered scheduler skips it).
+        //   2. No code path resets the LocalBlobDestinations, so they stay IN_PROGRESS forever.
+        // With the fix the outer catch transitions the task to READY (via executionFailed) so
+        // deleteTask can actually dequeue it, then resetForReaggregation puts destinations back
+        // to PENDING.
+        assertTrue(observedPending,
+                "Destinations must reach PENDING at some point after the write task fails to "
+                        + "start; otherwise they're orphaned IN_PROGRESS with a dead task and no "
+                        + "path to recovery.");
+    }
+
+    /**
+     * If invalidateTaskAndThrow fires on a write task because TapeAvailability.verifyAvailable
+     * throws (the real TapeAvailabilityImpl throws IllegalStateException at lines 164/174 when
+     * the selected tape has transitioned to a permanently-unavailable state between getNextTasks
+     * picking it and startTask validating it), the task transitions straight to COMPLETED via
+     * BaseTapeTask.prepareForExecutionIfPossible line 82 without runInternal ever running.
+     * cleanUpCompletedTasks later silently removes it from the queue.
+     *
+     * Because runInternal never ran, the LocalBlobDestinations are still IN_PROGRESS (set by
+     * TapeBlobStoreProcessorImpl.write before the task was enqueued) and never get reset.
+     *
+     * Test calls task.prepareForExecutionIfPossible directly (it's public) with a TapeAvailability
+     * mock whose verifyAvailable throws — faithful to the real failure mode.
+     */
+    @Test
+    public void testInvalidateWriteTaskResetsDestinationsToPending() throws Exception {
+        final MockDaoDriver mockDaoDriver = new MockDaoDriver(dbSupport);
+        final DataPolicy dp = mockDaoDriver.createABMConfigSingleCopyOnTape();
+        final Tape tape = mockDaoDriver.createTape(TapeState.NORMAL);
+        final TapePartition partition = mockDaoDriver.attainOneAndOnly(TapePartition.class);
+        final TapeDrive drive = mockDaoDriver.createTapeDrive(partition.getId(), "drv", tape.getId());
+        final Bucket bucket = mockDaoDriver.createBucket(null, dp.getId(), "bucket1");
+        final S3Object o = mockDaoDriver.createObject(bucket.getId(), "o");
+        final Blob blob = mockDaoDriver.getBlobFor(o.getId());
+        final Job job = mockDaoDriver.createJob(bucket.getId(), null, JobRequestType.PUT);
+        final JobEntry entry = mockDaoDriver.createJobEntry(job.getId(), blob);
+        final Set<LocalBlobDestination> destinations =
+                mockDaoDriver.createPersistenceTargetsForChunks(CollectionFactory.toSet(entry));
+        mockDaoDriver.markBlobInCache(blob.getId());
+
+        WorkAggregationUtils.markWriteChunksInProgress(
+                CollectionFactory.toSet(entry), dbSupport.getServiceManager());
+        WorkAggregationUtils.markLocalDestinationsInProgress(
+                destinations, dbSupport.getServiceManager());
+
+        final WriteChunkToTapeTask task = new WriteChunkToTapeTask(
+                BlobStoreTaskPriority.NORMAL,
+                destinations,
+                mock(TapeEjector.class),
+                new MockDiskManager(dbSupport.getServiceManager()),
+                new JobProgressManagerImpl(dbSupport.getServiceManager()),
+                new TapeFailureManagement(dbSupport.getServiceManager()),
+                dbSupport.getServiceManager());
+
+        assertTrue(mockDaoDriver.retrieveAll(LocalBlobDestination.class).stream()
+                        .allMatch(d -> d.getBlobStoreState() == JobChunkBlobStoreState.IN_PROGRESS),
+                "Destinations should start IN_PROGRESS");
+
+        // Mock TapeAvailability. The non-throwing answers feed selectTape (which uses the
+        // partition id and tape-in-drive to find candidates); verifyAvailable throws the same
+        // IllegalStateException the real TapeAvailabilityImpl throws at line 164 for a tape
+        // that has just become permanently unavailable.
+        final TapeAvailability mockAvailability = mock(TapeAvailability.class);
+        when(mockAvailability.getAllUnavailableTapes()).thenReturn(Collections.emptySet());
+        when(mockAvailability.getTapePartitionId()).thenReturn(partition.getId());
+        when(mockAvailability.getTapeInDrive()).thenReturn(tape.getId());
+        when(mockAvailability.getDriveId()).thenReturn(drive.getId());
+        when(mockAvailability.verifyAvailable(any())).thenThrow(
+                new IllegalStateException("Tape " + tape.getId() + " is permanently unavailable."));
+
+        final TapeDriveResource mockDriveResource = mock(TapeDriveResource.class);
+
+        try {
+            task.prepareForExecutionIfPossible(mockDriveResource, mockAvailability);
+            fail("prepareForExecutionIfPossible should have thrown");
+        } catch (final BlobStoreTaskNoLongerValidException expected) {
+            // expected — invalidateTaskAndThrow always rethrows
+        }
+
+        assertEquals(BlobStoreTaskState.COMPLETED, task.getState(),
+                "invalidateTaskAndThrow must leave the task in COMPLETED state");
+
+        assertTrue(mockDaoDriver.retrieveAll(LocalBlobDestination.class).stream()
+                        .allMatch(d -> d.getBlobStoreState() == JobChunkBlobStoreState.PENDING),
+                "Destinations must be reset to PENDING when the task is invalidated before "
+                        + "runInternal runs; otherwise cleanUpCompletedTasks will silently drop the "
+                        + "task and leave destinations orphaned IN_PROGRESS.");
+    }
+
 
     @Test
     public void testScheduleTestTapeDriveFailsWhenTapeIsAlreadyInTest() throws InterruptedException {

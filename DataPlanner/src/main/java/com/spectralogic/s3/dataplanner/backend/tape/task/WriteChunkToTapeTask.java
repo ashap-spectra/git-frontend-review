@@ -28,7 +28,6 @@ import com.spectralogic.s3.common.platform.api.TapeEjector;
 import com.spectralogic.s3.common.platform.cache.DiskManager;
 import com.spectralogic.s3.common.platform.iom.IomUtils;
 import com.spectralogic.s3.common.platform.iom.PersistenceProfile;
-import com.spectralogic.s3.common.platform.lang.NeedsImplementForRefactorException;
 import com.spectralogic.s3.common.rpc.dataplanner.DiskFileInfo;
 import com.spectralogic.s3.common.rpc.dataplanner.domain.BlobStoreTaskState;
 import com.spectralogic.s3.common.rpc.tape.TapeDriveResource;
@@ -40,6 +39,7 @@ import com.spectralogic.s3.common.rpc.tape.domain.S3ObjectIoRequest;
 import com.spectralogic.s3.common.rpc.tape.domain.S3ObjectsIoRequest;
 import com.spectralogic.s3.dataplanner.backend.frmwrk.LocalWriteDirective;
 import com.spectralogic.s3.dataplanner.backend.frmwrk.TapeWorkAggregationKey;
+import com.spectralogic.s3.dataplanner.backend.frmwrk.WorkAggregationUtils;
 import com.spectralogic.s3.dataplanner.backend.tape.api.DynamicTapeTask;
 import com.spectralogic.s3.dataplanner.backend.tape.api.TapeAvailability;
 import com.spectralogic.s3.dataplanner.backend.tape.processor.main.TapeFailureAction;
@@ -103,18 +103,6 @@ public final class WriteChunkToTapeTask extends BaseIoTask implements DynamicTap
                 sizeInBytes,
                 bucket);
         return dir;
-    }
-
-
-    public WriteChunkToTapeTask(
-            @NonNull final LocalWriteDirective writeDirective,
-            final TapeEjector tapeEjector,
-            @NonNull final DiskManager diskManager,
-            @NonNull final JobProgressManager jobProgressManager,
-            @NonNull final TapeFailureManagement tapeFailureManagement,
-            @NonNull final BeansServiceManager beansServiceManager)
-    {
-        this(writeDirective, null, tapeEjector, diskManager, jobProgressManager, tapeFailureManagement, beansServiceManager);
     }
 
 
@@ -423,7 +411,9 @@ public final class WriteChunkToTapeTask extends BaseIoTask implements DynamicTap
         if ( available < minimum )
         {
             if (m_tapeEjector == null) {
-                throw new NeedsImplementForRefactorException("we aren't currently passing in the tape ejector");
+                LOG.warn( "Storage domain is configured to auto-eject tapes when they are full, and tape " + tape.getId()
+                        + " is below the auto-eject threshold with only " + bytesRenderer.render( available )
+                        + " remaining, but no tape ejector is available to eject it." );
             }
             m_tapeEjector.ejectTape( 
                     storageDomain.getVerifyPriorToAutoEject(),
@@ -440,6 +430,19 @@ public final class WriteChunkToTapeTask extends BaseIoTask implements DynamicTap
     @Override
     public Collection<UUID> getChunkIds() {
         return BeanUtils.extractPropertyValues(getPersistenceTargets(), LocalBlobDestination.ENTRY_ID);
+    }
+
+
+    @Override
+    protected void onInvalidated() {
+        resetForReaggregation();
+    }
+
+
+    public void resetForReaggregation() {
+        WorkAggregationUtils.resetLocalDestinationsToPending(
+                m_writeDirective.getDestinations(), getServiceManager());
+        LOG.info("Reset destinations to PENDING for re-aggregation: " + this);
     }
 
 

@@ -1129,10 +1129,14 @@ public final class TapeBlobStoreProcessorImpl extends BaseShutdownable implement
                 {
                     prepareReadTaskForRechunking( (ChunkReadingTask)t );
                 }
+                else if ( t instanceof WriteChunkToTapeTask )
+                {
+                    ((WriteChunkToTapeTask)t).resetForReaggregation();
+                }
                 return;
             }
         }
-        
+
         LOG.warn( "Could not find task to delete it: " + t );
     }
     
@@ -1241,12 +1245,21 @@ public final class TapeBlobStoreProcessorImpl extends BaseShutdownable implement
         {
             m_tapeLockSupport.unlock( t );
             LOG.warn( "Task invalid: " + t, ex );
+            if ( BlobStoreTaskState.PENDING_EXECUTION == t.getState() )
+            {
+                // prepareForExecutionIfPossible succeeded (state -> PENDING_EXECUTION) but a
+                // subsequent step (addTapeLock, retriever attain, taskWorkPool submit) threw.
+                // TapeTaskQueueImpl.validateDequeue refuses to remove a task in PENDING_EXECUTION,
+                // so deleteTask would no-op and leak. executionFailed walks the state back to
+                // READY so deleteTask can actually remove it.
+                t.executionFailed( ex );
+            }
             deleteTask( t );
             return StartTaskResult.FAILED;
         }
     }
-    
-    
+
+
     private final class TapeChangingTaskExecutor implements Runnable
     {
         private TapeChangingTaskExecutor( final TapeTask task, final UUID driveId )
@@ -1480,32 +1493,38 @@ public final class TapeBlobStoreProcessorImpl extends BaseShutdownable implement
     private void cleanUpIoTasksThatNoLongerApply()
     {
         final Set< UUID > deletedChunkIds = m_tapeTasks.getChunkIds();
-        deletedChunkIds.removeAll( BeanUtils.toMap( 
+        deletedChunkIds.removeAll( BeanUtils.toMap(
                 m_serviceManager.getRetriever( JobEntry.class ).retrieveAll(
                         deletedChunkIds ).toSet() ).keySet() );
         if ( deletedChunkIds.isEmpty() )
         {
             return;
         }
-        
-        LOG.info( "I/O tasks have become invalid due to their chunks being deleted: " 
-                  + LogUtil.getShortVersion( deletedChunkIds, 5 ) );
+
+        final List<UUID> invalidatedChunkIds = new ArrayList<>();
         for ( final UUID deletedChunkId : deletedChunkIds )
         {
-            try
+            for ( final IoTask t : m_tapeTasks.getTasksForChunk( deletedChunkId ) )
             {
-                for (final IoTask t : m_tapeTasks.getTasksForChunk(deletedChunkId)) {
-                    if (t.getState() != BlobStoreTaskState.COMPLETED) {
-                        LOG.warn("Job chunk " + deletedChunkId + " no longer exists.");
-                        deleteTask(t);
-                    }
+                final BlobStoreTaskState state = t.getState();
+                // IN_PROGRESS / PENDING_EXECUTION tasks are in flight — typically this is the
+                // benign race where BlobStoreDriverImpl.cleanupCompletedEntriesAndDestinations
+                // deleted the JobEntry between the task's COMPLETED-transition commit and the
+                // BaseTask.run state transition. Let the task finish; cleanUpCompletedTasks will
+                // reap it on the next pass.
+                // COMPLETED tasks are already on their way out via cleanUpCompletedTasks.
+                if ( state != BlobStoreTaskState.READY && state != BlobStoreTaskState.NOT_READY )
+                {
+                    continue;
                 }
+                invalidatedChunkIds.add( deletedChunkId );
+                deleteTask( t );
             }
-            catch ( final IllegalStateException ex )
-            {
-                LOG.info( "Cannot delete I/O task for job chunk " + deletedChunkId + " at this time: " 
-                          + ex.getMessage() );
-            }
+        }
+        if ( !invalidatedChunkIds.isEmpty() )
+        {
+            LOG.info( "I/O tasks have become invalid due to their chunks being deleted: "
+                    + LogUtil.getShortVersion( invalidatedChunkIds, 5 ) );
         }
     }
     

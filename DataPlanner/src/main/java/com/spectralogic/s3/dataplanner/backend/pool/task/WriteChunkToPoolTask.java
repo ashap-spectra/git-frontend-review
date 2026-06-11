@@ -41,6 +41,7 @@ import com.spectralogic.s3.common.rpc.pool.PoolEnvironmentResource;
 import com.spectralogic.s3.dataplanner.backend.api.PersistenceType;
 import com.spectralogic.s3.dataplanner.backend.frmwrk.LocalWriteDirective;
 import com.spectralogic.s3.dataplanner.backend.frmwrk.ReadDirective;
+import com.spectralogic.s3.dataplanner.backend.frmwrk.WorkAggregationUtils;
 import com.spectralogic.s3.dataplanner.backend.pool.api.PoolLockSupport;
 import com.spectralogic.s3.dataplanner.backend.pool.api.PoolTask;
 import com.spectralogic.s3.dataplanner.backend.pool.frmwrk.PoolUtils;
@@ -99,6 +100,19 @@ public final class WriteChunkToPoolTask extends BasePoolTask
             getLockSupport().acquireWriteLock( retval, this, m_writeDirective.getSizeInBytes(), pool.getAvailableCapacity() );
             return retval;
         }
+    }
+
+
+    @Override
+    protected void onInvalidated() {
+        resetForReaggregation();
+    }
+
+
+    public void resetForReaggregation() {
+        WorkAggregationUtils.resetLocalDestinationsToPending(
+                m_writeDirective.getDestinations(), getServiceManager());
+        LOG.info("Reset destinations to PENDING for re-aggregation: " + this);
     }
 
     // Used to run zpool sync and sync calls

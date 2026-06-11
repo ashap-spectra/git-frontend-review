@@ -153,9 +153,22 @@ public abstract class BaseTask implements RunnableBlobStoreTask
             e.addSuppressed( ex );
             throw e;
         }
-        
+        onInvalidated();
         m_state = BlobStoreTaskState.COMPLETED;
         throw ex;
+    }
+
+
+    /**
+     * Invoked from invalidateTaskInternal while the task is still in READY state (runInternal has
+     * not run, and never will, for this task instance). Override to release or reset any external
+     * state — e.g. database rows the processor marked IN_PROGRESS in anticipation of this task
+     * running — so cleanUpCompletedTasks doesn't silently drop the task and leave that state
+     * stranded.
+     */
+    protected void onInvalidated()
+    {
+        // empty default
     }
     
     

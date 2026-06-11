@@ -30,6 +30,7 @@ import java.util.*;
 import java.util.function.Predicate;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.mock;
 
 public class TapeTaskQueueImpl_Test  {
 
@@ -179,7 +180,7 @@ public class TapeTaskQueueImpl_Test  {
         final DynamicTapeTask dynamicTask = new WriteChunkToTapeTask(
                 BlobStoreTaskPriority.values()[ 0 ],
                 pts,
-                InterfaceProxyFactory.getProxy( TapeEjector.class, null ),
+                mock(TapeEjector.class),
                 new MockDiskManager( dbSupport.getServiceManager() ),
                 new JobProgressManagerImpl( mockDaoDriver.getServiceManager(), JobProgressManagerImpl.BufferProgressUpdates.NO ),
                 new TapeFailureManagement(mockDaoDriver.getServiceManager()),
@@ -243,7 +244,7 @@ public class TapeTaskQueueImpl_Test  {
         final DynamicTapeTask dynamicTask = new WriteChunkToTapeTask(
                 BlobStoreTaskPriority.values()[ 0 ],
                 pts,
-                InterfaceProxyFactory.getProxy( TapeEjector.class, null ),
+                mock(TapeEjector.class),
                 new MockDiskManager( dbSupport.getServiceManager() ),
                 new JobProgressManagerImpl( mockDaoDriver.getServiceManager(), JobProgressManagerImpl.BufferProgressUpdates.NO ),
                 new TapeFailureManagement(mockDaoDriver.getServiceManager()),
